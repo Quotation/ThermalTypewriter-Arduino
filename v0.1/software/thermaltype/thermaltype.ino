@@ -71,12 +71,19 @@ public:
 public:
     // Idle state consumes no power
     void idle() {
+        if (isIdle) {
+            return;
+        }
+
         const uint8_t IDLE_PHASES[] = {0, 0, 0, 0};
         setPhases(IDLE_PHASES);
+        isIdle = true;
     }
 
     // One half-step forward or backward
     void step(bool forward = true) {
+        isIdle = false;
+
         const int totalSteps = ARRAY_SIZE(MOTOR_PHASES);
         currStep = (currStep + totalSteps + (forward ? 1 : -1)) % totalSteps;
         setPhases(MOTOR_PHASES[currStep]);
@@ -92,6 +99,7 @@ private:
 
 private:
     int currStep = -1;
+    bool isIdle = true;
 };
 
 
@@ -206,6 +214,12 @@ static constexpr uint8_t CHAR_RASTERS[][CHAR_HEIGHT] = {
     {0x00,0x00,0x00,0x71,0xDB,0x8E,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},/*"~",94*/
 };
 
+// Backspace glyph (dotted block)
+constexpr char BS_CHAR_CODE = 0x08;
+static constexpr uint8_t BS_CHAR_RASTER[CHAR_HEIGHT] = {
+    0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55,/*backspace*/
+};
+
 
 // Text layout format
 struct TextFormat
@@ -310,14 +324,19 @@ public:
 
         // convert to raster image indexes.
         // unknown characters are replaced with '?'
-        uint16_t rasterIndexes[lineChars];
+        const uint8_t* rasters[lineChars];
         for (int i = 0; i < lineChars; i++) {
             int c = text[i];
+            if (c == BS_CHAR_CODE) {
+                rasters[i] = BS_CHAR_RASTER;
+                continue;
+            }
+
             c -= CHAR_BEGIN;
             if (c < 0 || c >= (int)ARRAY_SIZE(CHAR_RASTERS)) {
                 c = '?' - CHAR_BEGIN;
             }
-            rasterIndexes[i] = (uint16_t)c;
+            rasters[i] = CHAR_RASTERS[c];
         }
 
         // alignment
@@ -343,7 +362,7 @@ public:
             int x = startX;
             for (int chIndex = 0; chIndex < lineChars; chIndex++) {
                 // simply copy and place images, 1bpp format
-                uint8_t raster = CHAR_RASTERS[rasterIndexes[chIndex]][y];
+                uint8_t raster = rasters[chIndex][y];
                 for (int i = 0; i < 8; i++) {
                     if ((raster & (1 << (7 - i))) == 0) {
                         x += format.scale;
@@ -395,77 +414,138 @@ private:
 // ============================
 // Typewriter
 
-constexpr int SCALED_CHAR_WIDTH  = CHAR_WIDTH * TEXT_SCALE;
-constexpr int SCALED_CHAR_HEIGHT = CHAR_HEIGHT * TEXT_SCALE;
-constexpr int ROW_CHARS = ROW_WIDTH / SCALED_CHAR_WIDTH;
-
-ThermalPrinter printer;
-TextFormat format;
-char textBuf[ROW_CHARS + 1];    // input text buffer
-int lastPos = 0;                // last printed position
-
-void setup()
+class Typewriter
 {
-    // connect to PC USB serial
-    Serial.begin(115200);
+public:
+    Typewriter() {}
 
-    printer.powerOn();
-    printer.feedLine(50);
+public:
+    void init() {
+        // connect to PC USB serial
+        Serial.begin(115200);
 
-    format.scale = TEXT_SCALE;
-}
+        printer.powerOn();
+        printer.feedLine(50);
 
-void loop()
-{
-    bool newLine = false;  // need break line
-    int newPos = lastPos;
-    while (newPos < ROW_CHARS) {
-        int c = Serial.read();
-        if (c < 0) {
-            break;
-        }
-
-        // force break line on receiving Enter
-        if (c == '\n') {
-            newLine = true;
-            break;
-        }
-
-        // buffer valid characters
-        if (c >= CHAR_BEGIN && c <= CHAR_BEGIN + ARRAY_SIZE(CHAR_RASTERS)) {
-            textBuf[newPos++] = c;
-        }
+        format.scale = TEXT_SCALE;
     }
 
-    // idle when possible to save power
-    if (newPos == lastPos && !newLine) {
-        printer.idle();
-        return;
+    void loop() {
+        while (newPos < ROW_CHARS) {
+            int c = Serial.read();
+            if (c < 0) {
+                break;
+            }
+
+            // force break line on receiving Enter
+            if (c == '\n') {
+                flush();
+                newLine();
+                break;
+            }
+
+            // ^H = backspace
+            if (c == BS_CHAR_CODE) {
+                flush();
+                backspace();
+                break;
+            }
+
+            // buffer valid characters
+            if (c >= CHAR_BEGIN && c <= CHAR_BEGIN + ARRAY_SIZE(CHAR_RASTERS)) {
+                textBuf[newPos++] = c;
+            }
+        }
+
+        flush();
+        
+        printer.idle();  // idle when possible to save power
     }
 
-    // has new characters to print
-    if (newPos != lastPos) {
+private:
+    void newLine() {
+        lastPos = newPos = 0;
+        bsPos = lastPos - 1;
+        bsLine = 0;
+        printer.feedLine(SCALED_CHAR_HEIGHT);
+    }
+
+    // print a block to cover previous character
+    void backspace() {
+        if (bsPos < 0) {
+            // goto previous line end
+            bsLine++;
+            bsPos = ROW_CHARS - 1;
+        }
+
+        memset(textBuf, ' ', bsPos);
+        textBuf[bsPos] = BS_CHAR_CODE;
+        textBuf[bsPos + 1] = '\0';
+
+        // roll back current line to heating points
+        printer.feedLine(-FEED_MARGIN - SCALED_CHAR_HEIGHT * (bsLine + 1));
+        printer.printText(textBuf, format);
+        //FIXME: 1-off bug, don't know why but this works
+        printer.feedLine(FEED_MARGIN - 1 + (SCALED_CHAR_HEIGHT - 1) * bsLine);
+
+        textBuf[bsPos] = textBuf[bsPos + 1] = ' ';
+        bsPos--;
+    }
+
+    // print out buffered text 
+    void flush() {
+        if (newPos == lastPos) {
+            return;
+        }
+
         // roll back current line to heating points
         printer.feedLine(-FEED_MARGIN - SCALED_CHAR_HEIGHT);
         textBuf[newPos] = '\0';
         printer.printText(textBuf, format);
+        //FIXME: 1-off bug, don't know why but this works
+        printer.feedLine(FEED_MARGIN - 1);
 
         if (newPos < ROW_CHARS) {
             // clear printed characters
             memset(textBuf + lastPos, ' ', newPos - lastPos);
             lastPos = newPos;
+            bsPos = lastPos - 1;
+            bsLine = 0;
         } else {
-            // line full, move to new line
-            lastPos = 0;
-            printer.feedLine(SCALED_CHAR_HEIGHT);
+            // line full
+            newLine();
         }
+    }
 
-        //FIXME: 1-off bug, don't know why but this works
-        printer.feedLine(FEED_MARGIN - 1);
-    }
-    
-    if (newLine) {
-        lastPos = 0;
-        printer.feedLine(SCALED_CHAR_HEIGHT);
-    }
+private:
+    constexpr static int SCALED_CHAR_WIDTH  = CHAR_WIDTH * TEXT_SCALE;
+    constexpr static int SCALED_CHAR_HEIGHT = CHAR_HEIGHT * TEXT_SCALE;
+    constexpr static int ROW_CHARS = ROW_WIDTH / SCALED_CHAR_WIDTH;
+
+    ThermalPrinter printer;
+    TextFormat format;
+    char textBuf[ROW_CHARS + 1];    // input text buffer
+
+    int lastPos = 0;                // last printed position
+    int newPos = 0;                 // valid character position
+
+    int bsPos = -1;                 // backspace position
+    int bsLine = 0;                 // backspace to previous lines
+};
+
+
+// ============================
+// main
+// 
+
+Typewriter typewriter;
+
+void setup()
+{
+    typewriter.init();
+}
+
+void loop()
+{
+    typewriter.loop();
 }
