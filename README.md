@@ -5,5 +5,5 @@ Too lazy to write document. Please watch the video.
 
 懒得写文档，看视频吧。
 
-* YouTube:
-* Bilibili:
+* YouTube: https://www.youtube.com/watch?v=uzSspplobKU
+* Bilibili: https://www.bilibili.com/video/BV1Ak4y1U7rX
